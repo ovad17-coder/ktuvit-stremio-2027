@@ -9,6 +9,7 @@
  *   KTUVIT_LOGIN_COOKIE     alternative to the two above: value of the "Login" cookie (u=...&g=...)
  *   ADDON_SECRET            optional; if set, the addon only answers under /<secret>/... (use when hosting publicly)
  *   RATE_LIMIT_PER_MIN      subtitle downloads allowed per client IP per minute (default 5)
+ *   STATS_KEY               optional; if set, /stats needs ?key=<value>
  *   PORT                    default 7000
  *   PUBLIC_URL              optional, e.g. https://my-addon.example.com (otherwise taken from the request)
  */
@@ -27,7 +28,7 @@ const UA =
 
 const manifest = {
   id: 'community.ktuvit.subtitles',
-  version: '1.2.0',
+  version: '1.3.0',
   name: 'Ktuvit Subtitles',
   description: 'Hebrew subtitles from ktuvit.me (unofficial)',
   resources: ['subtitles'],
@@ -259,12 +260,50 @@ function similarity(a, b) {
 const RATE = Number(process.env.RATE_LIMIT_PER_MIN) || 5;
 const hits = new Map();
 function allow(req) {
-  const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || '?';
+  const ip = clientIp(req);
   const now = Date.now();
   let h = hits.get(ip);
   if (!h || now - h.start > 60000) hits.set(ip, (h = { start: now, n: 0 }));
   if (hits.size > 20000) hits.clear();
   return ++h.n <= RATE;
+}
+
+/* ---------------------------------- stats ---------------------------------- */
+
+// Anonymous usage counters, kept in memory only (reset when the server restarts).
+// Visitors are counted by a salted hash of their IP; raw IPs are never stored.
+const STATS_SALT = crypto.randomBytes(16);
+const startedAt = new Date();
+const days = new Map(); // 'YYYY-MM-DD' -> { installs, lookups, downloads, users:Set }
+const titles = new Map(); // imdb id -> lookups
+function clientIp(req) {
+  return (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || '?';
+}
+function track(req, kind, imdbId) {
+  const day = new Date().toISOString().slice(0, 10);
+  let d = days.get(day);
+  if (!d) {
+    days.set(day, (d = { installs: 0, lookups: 0, downloads: 0, users: new Set() }));
+    while (days.size > 60) days.delete(days.keys().next().value);
+  }
+  d[kind]++;
+  if (kind !== 'installs' && d.users.size < 100000) {
+    d.users.add(crypto.createHash('sha256').update(STATS_SALT).update(clientIp(req)).digest('base64').slice(0, 12));
+  }
+  if (imdbId && (titles.has(imdbId) || titles.size < 20000)) titles.set(imdbId, (titles.get(imdbId) || 0) + 1);
+}
+function statsJson() {
+  const perDay = [...days].map(([day, d]) => ({
+    day, manifestRequests: d.installs, subtitleLookups: d.lookups, downloads: d.downloads, activeUsers: d.users.size,
+  })).reverse();
+  const sum = (k) => perDay.reduce((n, d) => n + d[k], 0);
+  return {
+    countingSince: startedAt.toISOString(),
+    note: 'In-memory counters: they reset whenever the server restarts or redeploys.',
+    totals: { manifestRequests: sum('manifestRequests'), subtitleLookups: sum('subtitleLookups'), downloads: sum('downloads') },
+    perDay,
+    topTitles: [...titles].sort((a, b) => b[1] - a[1]).slice(0, 20).map(([imdbId, lookups]) => ({ imdbId, lookups })),
+  };
 }
 
 /* ------------------------------- landing page ------------------------------ */
@@ -335,6 +374,13 @@ const server = http.createServer(async (req, res) => {
       pathname = pathname.slice(PREFIX.length) || '/';
     }
 
+    if (pathname === '/stats') {
+      const key = new URL(req.url, 'http://x').searchParams.get('key');
+      if (process.env.STATS_KEY && key !== process.env.STATS_KEY) return send(res, 404, { error: 'not found' });
+      return send(res, 200, JSON.stringify(statsJson(), null, 2), undefined, { 'cache-control': 'no-store' });
+    }
+
+    if (pathname === '/manifest.json') track(req, 'installs');
     if (pathname === '/' || pathname === '/manifest.json') {
       return pathname === '/'
         ? send(res, 200, landing(baseUrl(req)), 'text/html; charset=utf-8')
@@ -344,12 +390,14 @@ const server = http.createServer(async (req, res) => {
     // /subtitles/{type}/{id}.json  or  /subtitles/{type}/{id}/{extra}.json
     let m = pathname.match(/^\/subtitles\/(movie|series)\/([^/]+?)(?:\/(.+?))?\.json$/);
     if (m) {
+      track(req, 'lookups', decodeURIComponent(m[2]).split(':')[0]);
       const subtitles = await handleSubtitles(req, m[1], decodeURIComponent(m[2]), m[3] && decodeURIComponent(m[3]));
       return send(res, 200, { subtitles }, undefined, { 'cache-control': 'public, max-age=3600' });
     }
 
     m = pathname.match(/^\/sub\/([A-Za-z0-9]+)\/([A-Za-z0-9]+)\.srt$/);
     if (m) {
+      track(req, 'downloads');
       if (!allow(req)) return send(res, 429, 'Too many requests', 'text/plain', { 'retry-after': '60' });
       const srt = await cachedSrt(`srt:${m[2]}`, 6 * HOUR, () => downloadSub(m[1], m[2]));
       return send(res, 200, srt, 'application/x-subrip; charset=utf-8', {
